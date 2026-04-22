@@ -1,7 +1,7 @@
 """
 Ingest MODIS MAIAC AOD (MCD19A2CMG) and VIIRS NOAA-20 L3 AOD
 (AER_DBDT_D10KM_L3_VIIRS_NOAA20) into icechunk stores on GCS,
-month by month from 2019-01-01 to present.
+month by month for a given date range.
 
 Bbox: 20°E–100°E, 15°S–40°N  (Extended East Africa to India)
 
@@ -13,15 +13,29 @@ GCS stores:
   EARTHDATA_USERNAME, EARTHDATA_PASSWORD
   GCS_BUCKET, GCS_SERVICE_ACCOUNT_FILE
   MODIS_STORE_PATH, VIIRS_STORE_PATH
+
+Usage:
+  # Oct 2024 – Feb 2025
+  python ingest_aod_to_icechunk.py --start 20241001 --end 20250228
+
+  # Oct 2025 – Feb 2026
+  python ingest_aod_to_icechunk.py --start 20251001 --end 20260228
+
+  # Single product
+  python ingest_aod_to_icechunk.py --start 20241001 --end 20250228 --product viirs
+
+Each granule file is deleted immediately after it is read and subsetted,
+so peak local disk usage is one raw file (~44 MB) at a time.
 """
 
+import argparse
 import os
+import shutil
 import tempfile
 import numpy as np
 import xarray as xr
 import earthaccess
 import icechunk
-import zarr
 from pathlib import Path
 from datetime import date, timedelta
 from dateutil.relativedelta import relativedelta
@@ -30,29 +44,39 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── credentials & config ──────────────────────────────────────────────────────
-EARTHDATA_USERNAME    = os.environ["EARTHDATA_USERNAME"]
-EARTHDATA_PASSWORD    = os.environ["EARTHDATA_PASSWORD"]
-GCS_BUCKET            = os.environ["GCS_BUCKET"]
-GCS_SA_FILE           = os.environ["GCS_SERVICE_ACCOUNT_FILE"]
-MODIS_STORE_PATH      = os.environ["MODIS_STORE_PATH"]
-VIIRS_STORE_PATH      = os.environ["VIIRS_STORE_PATH"]
+EARTHDATA_USERNAME = os.environ["EARTHDATA_USERNAME"]
+EARTHDATA_PASSWORD = os.environ["EARTHDATA_PASSWORD"]
+GCS_BUCKET         = os.environ["GCS_BUCKET"]
+GCS_SA_FILE        = os.environ["GCS_SERVICE_ACCOUNT_FILE"]
+MODIS_STORE_PATH   = os.environ["MODIS_STORE_PATH"]
+VIIRS_STORE_PATH   = os.environ["VIIRS_STORE_PATH"]
 
 # ── spatial extent ────────────────────────────────────────────────────────────
-# Extended East Africa → India: 20°E–100°E, 15°S–40°N
 WEST, SOUTH, EAST, NORTH = 20, -15, 100, 40
 BBOX = (WEST, SOUTH, EAST, NORTH)
 
-# ── time range ────────────────────────────────────────────────────────────────
-START = date(2019, 1, 1)
-END   = date.today()
-
 # ── zarr chunking ─────────────────────────────────────────────────────────────
-TIME_CHUNK = 10   # days per chunk along time
+TIME_CHUNK = 10
 LAT_CHUNK  = 200
 LON_CHUNK  = 200
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--start", required=True,
+                   help="Start date YYYYMMDD, e.g. 20241001")
+    p.add_argument("--end",   required=True,
+                   help="End date YYYYMMDD,   e.g. 20250228")
+    p.add_argument("--product", choices=["modis", "viirs", "both"],
+                   default="both", help="Which product to ingest (default: both)")
+    return p.parse_args()
+
+
+def parse_date(s: str) -> date:
+    return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+
 
 def setup_earthdata() -> None:
     netrc = Path.home() / ".netrc"
@@ -73,11 +97,11 @@ def open_repo(store_path: str) -> icechunk.Repository:
 
 
 def month_range(start: date, end: date):
-    """Yield (month_start, month_end) for every month between start and end."""
+    """Yield (month_start, month_end) for every calendar month overlapping [start, end]."""
     cur = start.replace(day=1)
     while cur <= end:
         nxt = cur + relativedelta(months=1)
-        yield cur, min(nxt - timedelta(days=1), end)
+        yield max(cur, start), min(nxt - timedelta(days=1), end)
         cur = nxt
 
 
@@ -86,33 +110,31 @@ def month_range(start: date, end: date):
 def read_modis(filepath) -> xr.Dataset | None:
     """
     Open MCD19A2CMG (HDF-EOS2 / HDF4) with pyhdf.
-    Grid: 3600 lat × 7200 lon at 0.05°, upper-left origin 90°N / 180°W.
-    Returns xr.Dataset subsetted to BBOX or None on error.
+    Grid: 3600 lat × 7200 lon at 0.05°, descending lat (90→-90).
+    Returns bbox-subsetted xr.Dataset or None on error.
     """
     from pyhdf.SD import SD, SDC
 
     try:
         hdf = SD(os.fspath(filepath), SDC.READ)
         v   = hdf.select("AOD_055")
-        raw = v.get().astype(np.float32)           # shape (3600, 7200) — (lat, lon)
+        raw = v.get().astype(np.float32)
         att = v.attributes()
         hdf.end()
 
         fill  = att.get("_FillValue", -28672)
         scale = att.get("scale_factor", 0.001)
-
         raw[raw == fill] = np.nan
         aod = raw * scale
 
-        # CMG grid centres: lat top→bottom, lon left→right
-        lats = np.linspace(90 - 0.025, -90 + 0.025, 3600)   # 89.975 … -89.975
-        lons = np.linspace(-180 + 0.025, 180 - 0.025, 7200)  # -179.975 … 179.975
+        lats = np.linspace(90 - 0.025, -90 + 0.025, 3600)
+        lons = np.linspace(-180 + 0.025, 180 - 0.025, 7200)
 
         ds = xr.Dataset(
             {"AOD_055": (["lat", "lon"], aod)},
             coords={"lat": lats, "lon": lons},
         )
-        # subset to bbox (lat must be sliced high→low since it's descending)
+        # lat is descending so slice high→low
         return ds.sel(lat=slice(NORTH, SOUTH), lon=slice(WEST, EAST))
 
     except Exception as exc:
@@ -125,20 +147,15 @@ def read_modis(filepath) -> xr.Dataset | None:
 def read_viirs(filepath) -> xr.Dataset | None:
     """
     Open AER_DBDT_D10KM_L3_VIIRS_NOAA20 NetCDF.
-    dims: (Time=1, Longitude=3600, Latitude=1800) at 0.1°.
-    Returns xr.Dataset subsetted to BBOX or None on error.
+    dims: (Time=1, Longitude=3600, Latitude=1800) at 0.1°, ascending lat.
+    Returns bbox-subsetted xr.Dataset or None on error.
     """
     try:
         ds = xr.open_dataset(filepath, engine="netcdf4")
-
-        # Keep only the combined AOD variable
         ds = ds[["COMBINE_AOD_550_AVG"]].rename({"COMBINE_AOD_550_AVG": "AOD_055"})
-
-        # Rename coords to standard names and drop the Time dim (handled externally)
         ds = ds.rename({"Latitude": "lat", "Longitude": "lon"})
         ds = ds.squeeze("Time", drop=True)
-
-        # Subset: Longitude coord is (3600,) -180→180; Latitude is (1800,) -90→90
+        # lat is ascending so slice low→high
         return ds.sel(lat=slice(SOUTH, NORTH), lon=slice(WEST, EAST))
 
     except Exception as exc:
@@ -148,32 +165,44 @@ def read_viirs(filepath) -> xr.Dataset | None:
 
 # ── generic monthly ingest ────────────────────────────────────────────────────
 
+def already_stored(repo: icechunk.Repository, obs_date: date) -> bool:
+    """Return True if obs_date is already in the store."""
+    try:
+        session  = repo.readonly_session("main")
+        existing = xr.open_zarr(session.store(), consolidated=False)
+        stored   = existing.time.values.astype("datetime64[D]")
+        return np.datetime64(obs_date, "D") in stored
+    except Exception:
+        return False
+
+
+def store_is_empty(repo: icechunk.Repository) -> bool:
+    try:
+        session = repo.readonly_session("main")
+        xr.open_zarr(session.store(), consolidated=False)
+        return False
+    except Exception:
+        return True
+
+
 def ingest_product(
     short_name: str,
     version: str | None,
     store_path: str,
     reader,
     label: str,
+    start: date,
+    end: date,
 ) -> None:
-    repo  = open_repo(store_path)
-    first = True
+    print(f"\n{'='*60}")
+    print(f"[{label}] {start} → {end}")
+    print(f"  Store: gs://{GCS_BUCKET}/{store_path}")
+    print(f"{'='*60}")
 
-    # Detect if store already has data so we can resume
-    try:
-        session   = repo.readonly_session("main")
-        existing  = xr.open_zarr(session.store(), consolidated=False)
-        last_time = existing.time.values[-1]
-        resume_from = (
-            (last_time.astype("datetime64[D]").astype(date)) + timedelta(days=1)
-        )
-        first = False
-        print(f"[{label}] Resuming from {resume_from} (last stored: {last_time})")
-    except Exception:
-        resume_from = START
-        print(f"[{label}] Starting fresh from {START}")
+    repo = open_repo(store_path)
 
-    for month_start, month_end in month_range(resume_from, END):
-        print(f"\n[{label}] {month_start} → {month_end}")
+    for month_start, month_end in month_range(start, end):
+        print(f"\n[{label}] Month: {month_start} → {month_end}")
 
         search_kwargs = dict(
             short_name=short_name,
@@ -185,65 +214,104 @@ def ingest_product(
             search_kwargs["version"] = version
 
         granules = earthaccess.search_data(**search_kwargs)
-        print(f"  Found {len(granules)} granules")
+        print(f"  Granules found: {len(granules)}")
         if not granules:
             continue
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            files = earthaccess.download(granules, local_path=tmpdir)
+        daily = []
 
-            daily = []
-            for f, g in zip(sorted(files), granules):
-                t_str  = g["umm"]["TemporalExtent"]["RangeDateTime"]["BeginningDateTime"]
-                obs_dt = np.datetime64(t_str[:10], "ns")
-                ds     = reader(f)
-                if ds is None:
-                    continue
-                ds = ds.expand_dims(time=[obs_dt])
-                daily.append(ds)
+        # Download and process one file at a time — delete immediately after read
+        for g in granules:
+            t_str   = g["umm"]["TemporalExtent"]["RangeDateTime"]["BeginningDateTime"]
+            obs_dt  = date.fromisoformat(t_str[:10])
 
-            if not daily:
-                print("  No valid files — skipping month")
+            # Skip days already in the store
+            if already_stored(repo, obs_dt):
+                print(f"  skip {obs_dt} (already stored)")
                 continue
 
-            month_ds = xr.concat(daily, dim="time")
-            month_ds = month_ds.chunk(
-                {"time": TIME_CHUNK, "lat": LAT_CHUNK, "lon": LON_CHUNK}
-            )
+            tmpdir = tempfile.mkdtemp()
+            try:
+                files = earthaccess.download([g], local_path=tmpdir)
+                if not files:
+                    print(f"  {obs_dt}: download failed")
+                    continue
 
-            w_session = repo.writable_session("main")
-            store     = w_session.store()
+                filepath = files[0]
+                ds = reader(filepath)
 
-            if first:
-                month_ds.to_zarr(store, mode="w", consolidated=False, zarr_format=3)
-                first = False
-            else:
-                month_ds.to_zarr(store, append_dim="time", consolidated=False)
+                # Delete raw file immediately — only the small subset is kept
+                try:
+                    Path(filepath).unlink()
+                except Exception:
+                    pass
 
-            w_session.commit(f"{label} {month_start:%Y-%m}")
-            print(f"  Committed {len(daily)} days → gs://{GCS_BUCKET}/{store_path}")
+                if ds is None:
+                    continue
+
+                ds = ds.expand_dims(time=[np.datetime64(t_str[:10], "ns")])
+                daily.append(ds)
+                print(f"  {obs_dt}: read ok, subset shape {dict(ds.dims)}")
+
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
+        if not daily:
+            print(f"  No new data for {month_start:%Y-%m} — skipping commit")
+            continue
+
+        month_ds = xr.concat(daily, dim="time").sortby("time")
+        month_ds = month_ds.chunk(
+            {"time": TIME_CHUNK, "lat": LAT_CHUNK, "lon": LON_CHUNK}
+        )
+
+        w_session = repo.writable_session("main")
+        store_obj = w_session.store()
+
+        if store_is_empty(repo):
+            month_ds.to_zarr(store_obj, mode="w", consolidated=False, zarr_format=3)
+        else:
+            month_ds.to_zarr(store_obj, append_dim="time", consolidated=False)
+
+        w_session.commit(f"{label} {month_start:%Y-%m}")
+        print(f"  ✓ Committed {len(daily)} days → gs://{GCS_BUCKET}/{store_path}")
+
+        # Free memory
+        del daily, month_ds
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
+    args    = parse_args()
+    start   = parse_date(args.start)
+    end     = parse_date(args.end)
+    product = args.product
+
+    print(f"Run: {start} → {end}  |  product={product}")
     setup_earthdata()
 
-    ingest_product(
-        short_name="MCD19A2CMG",
-        version="061",
-        store_path=MODIS_STORE_PATH,
-        reader=read_modis,
-        label="MODIS MAIAC AOD",
-    )
+    if product in ("modis", "both"):
+        ingest_product(
+            short_name="MCD19A2CMG",
+            version="061",
+            store_path=MODIS_STORE_PATH,
+            reader=read_modis,
+            label="MODIS MAIAC AOD",
+            start=start,
+            end=end,
+        )
 
-    ingest_product(
-        short_name="AER_DBDT_D10KM_L3_VIIRS_NOAA20",
-        version=None,
-        store_path=VIIRS_STORE_PATH,
-        reader=read_viirs,
-        label="VIIRS NOAA-20 L3 AOD",
-    )
+    if product in ("viirs", "both"):
+        ingest_product(
+            short_name="AER_DBDT_D10KM_L3_VIIRS_NOAA20",
+            version=None,
+            store_path=VIIRS_STORE_PATH,
+            reader=read_viirs,
+            label="VIIRS NOAA-20 L3 AOD",
+            start=start,
+            end=end,
+        )
 
 
 if __name__ == "__main__":
