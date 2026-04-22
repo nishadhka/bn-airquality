@@ -169,7 +169,7 @@ def already_stored(repo: icechunk.Repository, obs_date: date) -> bool:
     """Return True if obs_date is already in the store."""
     try:
         session  = repo.readonly_session("main")
-        existing = xr.open_zarr(session.store(), consolidated=False)
+        existing = xr.open_zarr(session.store, consolidated=False)
         stored   = existing.time.values.astype("datetime64[D]")
         return np.datetime64(obs_date, "D") in stored
     except Exception:
@@ -179,7 +179,7 @@ def already_stored(repo: icechunk.Repository, obs_date: date) -> bool:
 def store_is_empty(repo: icechunk.Repository) -> bool:
     try:
         session = repo.readonly_session("main")
-        xr.open_zarr(session.store(), consolidated=False)
+        xr.open_zarr(session.store, consolidated=False)
         return False
     except Exception:
         return True
@@ -261,17 +261,25 @@ def ingest_product(
             continue
 
         month_ds = xr.concat(daily, dim="time").sortby("time")
-        month_ds = month_ds.chunk(
-            {"time": TIME_CHUNK, "lat": LAT_CHUNK, "lon": LON_CHUNK}
-        )
+        # chunk only spatial axes — time chunking is set once on first write via encoding
+        month_ds = month_ds.chunk({"time": -1, "lat": LAT_CHUNK, "lon": LON_CHUNK})
 
         w_session = repo.writable_session("main")
-        store_obj = w_session.store()
+        store_obj = w_session.store
 
         if store_is_empty(repo):
-            month_ds.to_zarr(store_obj, mode="w", consolidated=False, zarr_format=3)
+            # first write: encode time chunk size explicitly
+            encoding = {"AOD_055": {"chunks": [TIME_CHUNK, LAT_CHUNK, LON_CHUNK]}}
+            month_ds.to_zarr(
+                store_obj, mode="w", consolidated=False,
+                zarr_format=3, encoding=encoding,
+            )
         else:
-            month_ds.to_zarr(store_obj, append_dim="time", consolidated=False)
+            # sequential append — safe_chunks=False because we never write in parallel
+            month_ds.to_zarr(
+                store_obj, append_dim="time",
+                consolidated=False, safe_chunks=False,
+            )
 
         w_session.commit(f"{label} {month_start:%Y-%m}")
         print(f"  ✓ Committed {len(daily)} days → gs://{GCS_BUCKET}/{store_path}")
