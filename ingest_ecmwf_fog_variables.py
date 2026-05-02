@@ -120,10 +120,32 @@ logger = logging.getLogger(__name__)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# source.coop S3 target
-S3_BUCKET = "us-west-2.opendata.source.coop"
-S3_PREFIX = "e4drr-project/forecasts/ecmwf_fog_ifs_ens"
-S3_REGION = "us-west-2"
+
+def _load_dotenv_into_environ():
+    """Parse SCRIPT_DIR/.env (shell ``export`` syntax) into os.environ if it
+    exists. Runs at import so env-overridable constants (S3_BUCKET, S3_PREFIX)
+    pick up .env values. No-op on Coiled workers where .env is absent."""
+    env_path = SCRIPT_DIR / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:]
+        if "=" in line:
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+_load_dotenv_into_environ()
+
+# source.coop S3 target — overridable via env so the same code can target
+# different repos on source.coop (or any S3-compatible store) without an edit.
+S3_BUCKET = os.environ.get("S3_BUCKET", "us-west-2.opendata.source.coop")
+S3_PREFIX = os.environ.get("S3_PREFIX", "e4drr-project/forecasts/ecmwf_fog_ifs_ens")
+S3_REGION = os.environ.get("S3_REGION", "us-west-2")
 
 # HuggingFace parquet source
 HF_BASE_URL = (
@@ -628,6 +650,138 @@ def read_member_fog_vars(
     return {"date_str": date_str, "member_id": member_id, "data": out_data}
 
 
+# ─── Phase 2a: local-fill (single-machine smoke test) ──────────────────────
+
+
+def local_fill(args):
+    """Single-machine fill — no Coiled. Smoke-tests one day end-to-end against
+    the target store. Members run in a ThreadPoolExecutor; each member's
+    inner step fetches use the 8-thread pool inside read_member_fog_vars."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import icechunk
+    import xarray as xr
+
+    logger.info("=" * 60)
+    logger.info("LOCAL-FILL: ECMWF fog-vars Icechunk (no Coiled)")
+    logger.info("=" * 60)
+    overall_start = time.time()
+
+    dates = build_date_list(args.start_date, args.end_date)
+    members = MEMBER_IDS[:args.limit_members] if args.limit_members else MEMBER_IDS
+    logger.info(f"  Dates  : {len(dates)} ({dates[0]} -> {dates[-1]})")
+    logger.info(f"  Members: {len(members)} ({members[0]} .. {members[-1]})")
+    logger.info(f"  Member-parallelism: {args.member_workers}")
+
+    target_storage = make_storage(args.local)
+    target_repo = icechunk.Repository.open(
+        target_storage, config=icechunk.RepositoryConfig.default()
+    )
+
+    session_ro = target_repo.readonly_session("main")
+    template_ds = xr.open_zarr(session_ro.store, consolidated=False)
+    init_dates = pd.to_datetime(template_ds["init_date"].values)
+    date_to_idx = {d.strftime("%Y%m%d"): i for i, d in enumerate(init_dates)}
+    template_ds.close()
+
+    lat_idx_start = int(LAT_INDICES[0])
+    lat_idx_end = int(LAT_INDICES[-1]) + 1
+    lon_idx_start = int(LON_INDICES[0])
+    lon_idx_end = int(LON_INDICES[-1]) + 1
+
+    total_written = 0
+    for date_str in dates:
+        if date_str not in date_to_idx:
+            logger.error(f"  date {date_str} not in template init_date axis "
+                         f"(min={init_dates[0]}, max={init_dates[-1]}) — skip")
+            continue
+        date_idx = date_to_idx[date_str]
+        t_date = time.time()
+        logger.info(f"\n  -- {date_str}  (init_date idx {date_idx}) --")
+
+        member_data: Dict[int, dict] = {}
+        n_ok = 0
+        n_fail = 0
+
+        with ThreadPoolExecutor(max_workers=args.member_workers) as pool:
+            futs = {
+                pool.submit(
+                    read_member_fog_vars,
+                    date_str,
+                    member_id,
+                    LEAD_TIME_HOURS,
+                    SURFACE_VARS,
+                    PRESSURE_VARS,
+                    HF_BASE_URL,
+                    ECMWF_GRID_SHAPE,
+                    lat_idx_start, lat_idx_end,
+                    lon_idx_start, lon_idx_end,
+                    HF_COMBINED_URL,
+                ): (m_idx, member_id)
+                for m_idx, member_id in enumerate(members)
+            }
+            done = 0
+            for fut in as_completed(futs):
+                m_idx, member_id = futs[fut]
+                done += 1
+                try:
+                    member_data[m_idx] = fut.result()
+                    n_ok += 1
+                    logger.info(f"    [{done:2d}/{len(members):2d}] {member_id} OK")
+                except Exception as e:
+                    n_fail += 1
+                    logger.error(f"    [{done:2d}/{len(members):2d}] {member_id} FAILED: {e}")
+
+        if n_ok == 0:
+            logger.error(f"  {date_str}: all members failed — nothing to write")
+            continue
+
+        # Only allocate buffers for the requested member slice — full N_MEMBERS
+        # × 10 vars × float32 is ~7 GiB and OOMs on an 8 GiB box. Members are
+        # contiguous (we always take the first N), so we can write one zarr
+        # region covering exactly slice(0, len(members)).
+        n_m = len(members)
+        arrs = {
+            out_name: np.full(
+                (n_m, N_STEPS, N_LAT, N_LON), np.nan, dtype=np.float32
+            )
+            for out_name in ALL_OUT_NAMES
+        }
+        for m_i, res in member_data.items():
+            for out_name in ALL_OUT_NAMES:
+                arrs[out_name][m_i] = res["data"][out_name]
+
+        session = target_repo.writable_session("main")
+        ds_vars = {
+            out_name: (
+                ("init_date", "member", "lead_time", "lat", "lon"),
+                arrs[out_name][np.newaxis],
+            )
+            for out_name in ALL_OUT_NAMES
+        }
+        ds_write = xr.Dataset(ds_vars)
+        ds_write.to_zarr(
+            session.store,
+            region={
+                "init_date": slice(date_idx, date_idx + 1),
+                "member": slice(0, n_m),
+            },
+            consolidated=False,
+        )
+        session.commit(
+            f"fill date {date_idx} ({date_str}): {n_ok}/{len(members)} members "
+            f"[local-fill]"
+        )
+        total_written += 1
+        logger.info(f"  {date_str}: committed in {time.time() - t_date:.1f}s "
+                    f"({n_ok}/{len(members)} members, {n_fail} failed)")
+
+    elapsed = time.time() - overall_start
+    logger.info("=" * 60)
+    logger.info(f"LOCAL-FILL COMPLETE: {total_written}/{len(dates)} dates "
+                f"in {elapsed/60:.1f} min")
+    logger.info("=" * 60)
+
+
 # ─── Phase 2: fill ──────────────────────────────────────────────────────────
 
 
@@ -702,9 +856,14 @@ def fill_store(args):
     total_failed = 0
     failed_dates: List[str] = []
     timed_out = False
-    COMMIT_BATCH = args.commit_batch
 
-    for batch_start in range(0, len(remaining), COMMIT_BATCH):
+    # Process one date at a time. As each member future completes, stream-write
+    # its slab into a single writable_session (chunk-aligned: one chunk per
+    # (date, member)), then commit once per date. This keeps the coordinator
+    # memory peak at ~150 MiB instead of the ~14 GiB the previous batch-buffer
+    # approach required (51 members × 53 steps × 221 × 321 × float32 × 10 vars
+    # — buffered both in date_members and in arrs simultaneously).
+    for date_idx, date_str in remaining:
         elapsed_session = time.time() - session_start
         if elapsed_session > timeout:
             logger.warning(
@@ -715,113 +874,100 @@ def fill_store(args):
             timed_out = True
             break
 
-        batch = remaining[batch_start: batch_start + COMMIT_BATCH]
-        n_tasks = len(batch) * N_MEMBERS
+        date_t0 = time.time()
         logger.info(
-            f"  Batch: date indices {batch[0][0]}-{batch[-1][0]} "
-            f"({len(batch)} dates x {N_MEMBERS} members = {n_tasks} tasks, "
-            f"{total_written}/{len(remaining)} dates done, "
+            f"\n  -- date {date_idx} ({date_str}) — submitting {N_MEMBERS} "
+            f"member fetches  ({total_written}/{len(remaining)} done, "
             f"{elapsed_session:.0f}s/{timeout}s budget)"
         )
 
         futures = {}
-        for date_idx, date_str in batch:
-            for m_idx, member_id in enumerate(MEMBER_IDS):
-                future = client.submit(
-                    read_member_fog_vars,
-                    date_str,
-                    member_id,
-                    LEAD_TIME_HOURS,
-                    SURFACE_VARS,
-                    PRESSURE_VARS,
-                    HF_BASE_URL,
-                    ECMWF_GRID_SHAPE,
-                    lat_idx_start, lat_idx_end,
-                    lon_idx_start, lon_idx_end,
-                    HF_COMBINED_URL,
-                    key=f"d{date_idx}-m{m_idx:02d}",
-                )
-                futures[future] = (date_idx, date_str, m_idx)
+        for m_idx, member_id in enumerate(MEMBER_IDS):
+            future = client.submit(
+                read_member_fog_vars,
+                date_str,
+                member_id,
+                LEAD_TIME_HOURS,
+                SURFACE_VARS,
+                PRESSURE_VARS,
+                HF_BASE_URL,
+                ECMWF_GRID_SHAPE,
+                lat_idx_start, lat_idx_end,
+                lon_idx_start, lon_idx_end,
+                HF_COMBINED_URL,
+                key=f"d{date_idx}-m{m_idx:02d}",
+            )
+            futures[future] = (m_idx, member_id)
 
-        date_members: Dict[int, Dict[int, dict]] = {}
-        date_expected: Dict[int, int] = {}
-        date_fail_count: Dict[int, int] = {}
-        tasks_done = 0
-
-        for future in distributed.as_completed(futures):
-            date_idx, date_str, m_idx = futures[future]
+        session = target_repo.writable_session("main")
+        n_ok = 0
+        n_fail = 0
+        write_failed = False
+        for future in distributed.as_completed(list(futures.keys())):
+            m_idx, member_id = futures[future]
             try:
                 result = future.result()
-                date_members.setdefault(date_idx, {})[m_idx] = result
-            except Exception:
-                date_fail_count[date_idx] = date_fail_count.get(date_idx, 0) + 1
-
-            date_expected[date_idx] = date_expected.get(date_idx, 0) + 1
-            tasks_done += 1
-
-            if tasks_done % 100 == 0:
-                logger.info(
-                    f"    Progress: {tasks_done}/{n_tasks} tasks done "
-                    f"({time.time() - session_start:.0f}s/{timeout}s)"
-                )
-
-            if date_expected[date_idx] != N_MEMBERS:
+            except Exception as e:
+                n_fail += 1
+                logger.error(f"    member {member_id} (m_idx={m_idx}) FETCH FAILED: {e}")
                 continue
-
-            members = date_members.pop(date_idx, {})
-            n_ok = len(members)
-            n_fail = date_fail_count.get(date_idx, 0)
-
-            if n_ok == 0:
-                total_failed += 1
-                failed_dates.append(date_str)
-                logger.error(
-                    f"    Date {date_idx} ({date_str}) FAILED: 0/{N_MEMBERS} members"
-                )
-                continue
-
-            arrs = {
-                out_name: np.full(
-                    (N_MEMBERS, N_STEPS, N_LAT, N_LON), np.nan, dtype=np.float32
-                )
-                for out_name in ALL_OUT_NAMES
-            }
-            for m_i, res in members.items():
-                for out_name in ALL_OUT_NAMES:
-                    arrs[out_name][m_i] = res["data"][out_name]
-            del members
 
             try:
-                session = target_repo.writable_session("main")
                 ds_vars = {
                     out_name: (
                         ("init_date", "member", "lead_time", "lat", "lon"),
-                        arrs[out_name][np.newaxis],
+                        result["data"][out_name][np.newaxis, np.newaxis],
                     )
                     for out_name in ALL_OUT_NAMES
                 }
-                ds_write = xr.Dataset(ds_vars)
-                ds_write.to_zarr(
+                xr.Dataset(ds_vars).to_zarr(
                     session.store,
-                    region={"init_date": slice(date_idx, date_idx + 1)},
+                    region={
+                        "init_date": slice(date_idx, date_idx + 1),
+                        "member": slice(m_idx, m_idx + 1),
+                    },
                     consolidated=False,
                 )
-                del arrs, ds_write
-                session.commit(
-                    f"fill date {date_idx} ({date_str}): {n_ok}/{N_MEMBERS} members"
-                )
-                total_written += 1
-                logger.info(
-                    f"    Committed date {date_idx} ({date_str}) "
-                    f"[{n_ok}/{N_MEMBERS} members, {n_fail} failed] "
-                    f"({total_written}/{len(remaining)} total)"
-                )
+                n_ok += 1
+                del result, ds_vars
+                if n_ok % 10 == 0 or n_ok == N_MEMBERS:
+                    logger.info(
+                        f"    [{n_ok + n_fail:2d}/{N_MEMBERS}] "
+                        f"member {member_id} written "
+                        f"(ok={n_ok}, failed={n_fail}, "
+                        f"{time.time() - date_t0:.0f}s elapsed)"
+                    )
             except Exception as e:
-                total_failed += 1
-                failed_dates.append(date_str)
-                logger.error(
-                    f"    Date {date_idx} ({date_str}) WRITE/COMMIT FAILED: {e}"
-                )
+                write_failed = True
+                logger.error(f"    member {member_id} WRITE FAILED: {e}")
+                break
+
+        if write_failed or n_ok == 0:
+            total_failed += 1
+            failed_dates.append(date_str)
+            logger.error(
+                f"    Date {date_idx} ({date_str}) FAILED — discarding session "
+                f"(ok={n_ok}, failed={n_fail})"
+            )
+            continue
+
+        try:
+            session.commit(
+                f"fill date {date_idx} ({date_str}): {n_ok}/{N_MEMBERS} members"
+            )
+            total_written += 1
+            logger.info(
+                f"    Committed date {date_idx} ({date_str}) "
+                f"[{n_ok}/{N_MEMBERS} members, {n_fail} failed] "
+                f"in {time.time() - date_t0:.0f}s "
+                f"({total_written}/{len(remaining)} total)"
+            )
+        except Exception as e:
+            total_failed += 1
+            failed_dates.append(date_str)
+            logger.error(
+                f"    Date {date_idx} ({date_str}) COMMIT FAILED: {e}"
+            )
 
     client.close()
     cluster.close()
@@ -931,6 +1077,17 @@ def main():
     p_init.add_argument("--start-date", type=str, default="20251001")
     p_init.add_argument("--end-date",   type=str, default="20251031")
 
+    p_local = sub.add_parser("local-fill", parents=[common],
+                             help="Single-machine smoke test (no Coiled) — fills "
+                                  "the already-init'd store for the given date(s)")
+    p_local.add_argument("--start-date",     type=str, default="20251001")
+    p_local.add_argument("--end-date",       type=str, default="20251001")
+    p_local.add_argument("--limit-members",  type=int, default=None,
+                         help="Only fetch the first N members (smoke test); "
+                              "missing members stored as NaN")
+    p_local.add_argument("--member-workers", type=int, default=4,
+                         help="Concurrent member fetches (default 4)")
+
     p_fill = sub.add_parser("fill", parents=[common],
                             help="Fill store from HF parquets + S3 GRIB byte-range reads")
     p_fill.add_argument("--start-date",      type=str, default="20251001")
@@ -939,7 +1096,7 @@ def main():
     p_fill.add_argument("--commit-batch",    type=int, default=10,
                         help="Number of dates per processing batch")
     p_fill.add_argument("--worker-vm-types", type=str, default="e2-standard-4")
-    p_fill.add_argument("--coiled-region",   type=str, default="europe-west1")
+    p_fill.add_argument("--coiled-region",   type=str, default="us-east1")
     p_fill.add_argument("--workspace",       type=str, default=None,
                         help="Coiled workspace (default: account default)")
     p_fill.add_argument("--credential-timeout", type=int,
@@ -957,6 +1114,8 @@ def main():
         probe_levels(args)
     elif args.command == "init":
         init_store(args)
+    elif args.command == "local-fill":
+        local_fill(args)
     elif args.command == "fill":
         fill_store(args)
     elif args.command == "verify":

@@ -1,5 +1,7 @@
 .env
 *.json
+*.log
+.claude/
 .ipynb_checkpoints/
 __pycache__/
 *.pyc
